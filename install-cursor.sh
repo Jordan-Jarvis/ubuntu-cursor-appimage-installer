@@ -133,58 +133,52 @@ find_cursor_installation() {
 get_download_info() {
     local release_track=${1:-stable}
     local arch=$(get_arch)
-    
-    if ! command -v jq &>/dev/null && ! command -v curl &>/dev/null; then
-        log_error "This script requires 'curl' and 'jq' to be installed."
-        log_info "Install them with:"
-        echo "  - Debian/Ubuntu: sudo apt-get install curl jq"
-        echo "  - Fedora: sudo dnf install curl jq"
-        echo "  - Arch Linux: sudo pacman -S curl jq"
-        exit 1
-    fi
-    
-    local api_url="https://www.cursor.com/api/download?platform=linux-${arch}&releaseTrack=${release_track}"
+
+    # Primary method: official JSON API
+    local api_url="https://cursor.com/api/download?platform=linux-${arch}&releaseTrack=${release_track}"
     local temp_file=$(mktemp)
-    
-    log_info "Fetching download info for $release_track track..."
-    
-    if ! curl -s "$api_url" -o "$temp_file"; then
+
+    if curl -fsSL "$api_url" -o "$temp_file"; then
+        # Parse JSON manually (no jq dependency)
+        local download_url="$(grep -o '"downloadUrl":"[^"]*' "$temp_file" | head -n1 | cut -d'"' -f4)"
+        local version="$(grep -o '"version":"[^"]*' "$temp_file" | head -n1 | cut -d'"' -f4)"
         rm -f "$temp_file"
-        log_error "Failed to fetch download information"
-        return 1
-    fi
-    
-    if command -v jq &>/dev/null; then
-        local download_url version
-        download_url=$(jq -r '.downloadUrl' "$temp_file" 2>/dev/null)
-        version=$(jq -r '.version' "$temp_file" 2>/dev/null)
-        
-        if [[ "$download_url" == "null" ]] || [[ "$version" == "null" ]]; then
-            rm -f "$temp_file"
-            log_error "Invalid API response"
-            return 1
+        if [[ -n "$download_url" && -n "$version" ]]; then
+            echo "URL=$download_url"
+            echo "VERSION=$version"
+            return 0
         fi
-        
-        echo "URL=$download_url"
-        echo "VERSION=$version"
-    else
-        # Fallback without jq (basic parsing)
-        local download_url version
-        download_url=$(grep -o '"downloadUrl":"[^"]*"' "$temp_file" | cut -d'"' -f4)
-        version=$(grep -o '"version":"[^"]*"' "$temp_file" | cut -d'"' -f4)
-        
-        if [[ -z "$download_url" ]] || [[ -z "$version" ]]; then
-            rm -f "$temp_file"
-            log_error "Failed to parse API response"
-            return 1
-        fi
-        
-        echo "URL=$download_url"
-        echo "VERSION=$version"
     fi
-    
     rm -f "$temp_file"
-    return 0
+
+    # Fallback #1: redirector service (.com)
+    local redirector="https://downloader.cursor.com/linux/appImage/${arch}"
+    local final_url="$(curl -Ls -o /dev/null -w "%{url_effective}" "$redirector" 2>/dev/null)"
+    if [[ -n "$final_url" && "$final_url" == *.AppImage ]]; then
+        local version="unknown"
+        if [[ "$final_url" =~ Cursor-([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            version="${BASH_REMATCH[1]}"
+        fi
+        echo "URL=$final_url"
+        echo "VERSION=$version"
+        return 0
+    fi
+
+    # Fallback #2: redirector service (.sh)
+    redirector="https://downloader.cursor.sh/linux/appImage/${arch}"
+    final_url="$(curl -Ls -o /dev/null -w "%{url_effective}" "$redirector" 2>/dev/null)"
+    if [[ -n "$final_url" && "$final_url" == *.AppImage ]]; then
+        local version="unknown"
+        if [[ "$final_url" =~ Cursor-([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            version="${BASH_REMATCH[1]}"
+        fi
+        echo "URL=$final_url"
+        echo "VERSION=$version"
+        return 0
+    fi
+
+    log_error "Unable to determine the latest Cursor download URL. Please check your Internet connection or report an issue."
+    return 1
 }
 
 # Download and install Cursor
@@ -256,37 +250,44 @@ setup_desktop_integration() {
     local temp_dir=$(mktemp -d)
     cd "$temp_dir"
     
-    "$appimage" --appimage-extract > /dev/null 2>&1
+    # Copy AppImage to a temporary directory to run extraction as the user.
+    # This avoids FUSE permission issues when the AppImage is in a root-owned location.
+    local temp_appimage="cursor-temp.AppImage"
+    cp "$appimage" "$temp_appimage"
+    chmod +x "$temp_appimage"
+
+    # Extract AppImage contents.
+    # The output is captured for debugging in case of failure.
+    local extract_log
+    extract_log=$(mktemp)
+    if ! "./$temp_appimage" --appimage-extract >"$extract_log" 2>&1; then
+        log_error "Could not extract AppImage contents."
+        log_error "This is required for proper desktop integration (icons, etc)."
+        log_error "Please ensure 'fuse' or 'fuse2' is installed and working correctly."
+        log_error "Extraction log output:"
+        cat "$extract_log"
+        rm -f "$extract_log"
+        cd - > /dev/null
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    rm -f "$extract_log"
     
     # Create directories
     mkdir -p "$HOME/.local/share/applications"
     mkdir -p "$HOME/.local/share/icons/hicolor/256x256/apps"
     
-    # Copy icon
+    # Copy icon if available
     if [[ -f "squashfs-root/usr/share/icons/hicolor/256x256/apps/cursor.png" ]]; then
         cp "squashfs-root/usr/share/icons/hicolor/256x256/apps/cursor.png" \
            "$HOME/.local/share/icons/hicolor/256x256/apps/"
+        # Also copy to install directory for desktop file reference
+        sudo cp "squashfs-root/usr/share/icons/hicolor/256x256/apps/cursor.png" \
+           "$install_dir/cursor.png"
         log_info "Icon installed successfully"
     else
         log_warn "Could not extract icon"
     fi
-    
-    # Create desktop entry
-    cat > "$HOME/.local/share/applications/cursor.desktop" << EOF
-[Desktop Entry]
-Name=Cursor
-Comment=AI-powered code editor
-Exec=$appimage --no-sandbox %F
-Icon=cursor
-Terminal=false
-Type=Application
-Categories=Development;TextEditor;
-MimeType=text/plain;application/javascript;application/json;text/css;text/html;text/xml;
-StartupNotify=true
-StartupWMClass=cursor
-EOF
-    
-    chmod +x "$HOME/.local/share/applications/cursor.desktop"
     
     # Update desktop database
     if command -v update-desktop-database &>/dev/null; then
@@ -296,76 +297,56 @@ EOF
     cd - > /dev/null
     rm -rf "$temp_dir"
     
+    # Always regenerate the launcher wrapper & desktop entry so they stay in sync
+    create_command_wrapper
+    
     log_info "Desktop integration completed"
 }
 
 # Create command wrapper
 create_command_wrapper() {
     local install_dir="/opt/cursor"
-    local appimage="$install_dir/cursor.AppImage"
-    
-    # Create local bin directory
+    local appimage="$install_dir/cursor.AppImage"  # always points to current version via symlink
+
     mkdir -p "$HOME/.local/bin"
-    
-    # Create wrapper script
-    log_info "Creating cursor command wrapper"
-    cat > "$HOME/.local/bin/cursor" << EOF
+
+    # Overwrite wrapper with a lightweight launcher that always follows the symlink
+    cat > "$HOME/.local/bin/cursor" <<'EOS'
 #!/bin/bash
-
-# Cursor command wrapper
-CURSOR_APPIMAGE="$appimage"
-INSTALL_DIR="$install_dir"
-
-show_version() {
-    if [[ -f "\$INSTALL_DIR/.cursor_version" ]]; then
-        local version=\$(cat "\$INSTALL_DIR/.cursor_version")
-        echo "Cursor version: \$version"
-    else
-        echo "Version information not available"
-        return 1
-    fi
-}
-
-show_help() {
-    echo "Cursor - AI-powered code editor"
-    echo
-    echo "Usage: cursor [options] [files/directories]"
-    echo
-    echo "Options:"
-    echo "  --version, -v    Show version information"
-    echo "  --help, -h       Show this help message"
-    echo
-    echo "Examples:"
-    echo "  cursor           Launch Cursor"
-    echo "  cursor .         Open current directory"
-    echo "  cursor file.js   Open specific file"
-    echo
-}
-
-# Parse arguments
-case "\$1" in
-    --version|-v)
-        show_version
-        exit \$?
-        ;;
-    --help|-h)
-        show_help
+APPIMAGE="/opt/cursor/cursor.AppImage"
+if [[ "$1" == "--version" || "$1" == "-v" ]]; then
+    if [[ -f "/opt/cursor/.cursor_version" ]]; then
+        cat /opt/cursor/.cursor_version
         exit 0
-        ;;
-    *)
-        if [[ ! -f "\$CURSOR_APPIMAGE" ]]; then
-            echo "Error: Cursor AppImage not found at \$CURSOR_APPIMAGE"
-            echo "Please reinstall Cursor using the installer script."
-            exit 1
-        fi
-        
-        # Launch Cursor in background
-        nohup "\$CURSOR_APPIMAGE" --no-sandbox "\$@" > /dev/null 2>&1 & disown
-        ;;
-esac
-EOF
-    
+    fi
+fi
+if [[ ! -f "$APPIMAGE" ]]; then
+    echo "Cursor AppImage not found at $APPIMAGE" >&2
+    exit 1
+fi
+nohup "$APPIMAGE" --no-sandbox "$@" >/dev/null 2>&1 & disown
+EOS
+
     chmod +x "$HOME/.local/bin/cursor"
+
+    # Ensure desktop file Exec line also points to the symlink so menu entries
+    # always open the latest version.
+    local desktop_file="$HOME/.local/share/applications/cursor.desktop"
+    mkdir -p "$(dirname "$desktop_file")"
+    cat > "$desktop_file" <<DESK
+[Desktop Entry]
+Name=Cursor
+Comment=AI-powered code editor
+Exec=/opt/cursor/cursor.AppImage --no-sandbox %F
+Icon=/opt/cursor/cursor.png
+Terminal=false
+Type=Application
+Categories=Development;TextEditor;
+MimeType=text/plain;application/javascript;application/json;text/css;text/html;text/xml;
+StartupNotify=true
+StartupWMClass=cursor
+DESK
+    chmod +x "$desktop_file"
 }
 
 # Setup PATH
